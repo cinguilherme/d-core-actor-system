@@ -33,6 +33,26 @@
   ([client entity-type entity-id message opts]
    (client/ask-sync! client entity-type entity-id message opts)))
 
+(defn- resolve-engine [runtime-or-engine]
+  (or (:engine runtime-or-engine) runtime-or-engine))
+
+(defn trigger-tick!
+  "Synchronously dispatches a `{:type :tick}` message to all active actors or a specific entity actor."
+  ([runtime-or-engine]
+   (engine/trigger-tick! (resolve-engine runtime-or-engine)))
+  ([runtime-or-engine entity-type entity-id]
+   (engine/trigger-tick! (resolve-engine runtime-or-engine) entity-type entity-id)))
+
+(defn sweep-idle-actors!
+  "Deterministically runs one passivation sweep at `(time/now-ms)` and returns passivated entity keys."
+  [runtime-or-engine]
+  (engine/sweep-idle-actors! (resolve-engine runtime-or-engine)))
+
+(defn flush-actor!
+  "Synchronously flushes an active actor's state to its SnapshotStore."
+  [runtime-or-engine entity-type entity-id]
+  (engine/flush-actor! (resolve-engine runtime-or-engine) entity-type entity-id))
+
 (defn- subscribe-all-entities!
   [transport engine entities options]
   (reduce (fn [subs [entity-type _spec]]
@@ -51,12 +71,22 @@
    - :transport (ActorTransport implementation, defaults to in-memory)
    - :storage   (ActorSnapshotStore implementation, defaults to in-memory)
    - :entities  (map of {entity-type entity-spec})
-   - :options   (e.g. :default-idle-timeout-ms, :watchdog-interval-ms)"
-  [{:keys [transport storage entities options]}]
+   - :producer  (optional ProducerProtocol for :publish effects)
+   - :db        (optional database handle for custom effects)
+   - :effect-handler (optional fn [effect ctx] for custom effects)
+   - :options   (e.g. :default-idle-timeout-ms, :watchdog-interval-ms, :partition, :partitions)"
+  [{:keys [transport storage entities producer db effect-handler options]}]
   (let [actual-storage (or storage (in-mem-storage/create-in-memory-snapshot-store))
         actual-transport (or transport (in-mem-transport/create-in-memory-transport))
-        engine (engine/create-actor-engine entities actual-storage options)
-        subs (subscribe-all-entities! actual-transport engine entities options)]
+        effect-ctx (merge {:transport actual-transport
+                           :storage actual-storage
+                           :producer producer
+                           :db db
+                           :effect-handler effect-handler}
+                          (:effect-ctx options))
+        engine-opts (assoc (or options {}) :effect-ctx effect-ctx)
+        engine (engine/create-actor-engine entities actual-storage engine-opts)
+        subs (subscribe-all-entities! actual-transport engine entities (or options {}))]
     {:engine engine
      :transport actual-transport
      :storage actual-storage

@@ -1,5 +1,6 @@
 (ns d-core.actor-system.runtime.passivation
-  (:require [d-core.actor-system.runtime.actor :as actor]))
+  (:require [d-core.actor-system.runtime.actor :as actor]
+            [d-core.libs.time :as time]))
 
 (defn find-idle-actors
   "Pure function: filters active actors map for entities that have exceeded their idle timeout."
@@ -18,7 +19,7 @@
 (defn scan-and-passivate!
   "Executes one pass of the passivation scan against the runtime active actors."
   [active-atom passivate-fn! default-timeout-ms]
-  (let [now (System/currentTimeMillis)
+  (let [now (time/now-ms)
         active @active-atom
         idle-keys (find-idle-actors active now default-timeout-ms)]
     (doseq [[entity-type entity-id] idle-keys]

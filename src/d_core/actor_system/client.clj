@@ -1,12 +1,14 @@
 (ns d-core.actor-system.client
-  (:require [d-core.actor-system.protocols :as p]))
+  (:require [d-core.actor-system.protocols :as p]
+            [d-core.libs.time :as time]))
 
 (defn- build-envelope
   [payload opts]
-  {:type :message
-   :payload payload
-   :context (:context opts)
-   :timestamp (System/currentTimeMillis)})
+  (cond-> {:type :message
+           :payload payload
+           :context (:context opts)
+           :timestamp (time/now-ms)}
+    (:sequence opts) (assoc :sequence (:sequence opts))))
 
 (defrecord DefaultActorClient [transport options]
   p/ActorClient

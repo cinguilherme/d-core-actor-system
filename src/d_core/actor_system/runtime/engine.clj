@@ -2,7 +2,8 @@
   (:require [d-core.actor-system.behavior :as behavior]
             [d-core.actor-system.protocols :as p]
             [d-core.actor-system.runtime.actor :as actor]
-            [d-core.actor-system.runtime.passivation :as pass])
+            [d-core.actor-system.runtime.passivation :as pass]
+            [d-core.libs.time :as time])
   (:import [java.util.concurrent ConcurrentHashMap]
            [java.util.function Function]))
 
@@ -10,21 +11,23 @@
   [(keyword entity-type) (str entity-id)])
 
 (defn- activate-actor!
-  [entity-type entity-id entity-spec snapshot-store]
+  [entity-type entity-id entity-spec snapshot-store effect-ctx]
   (let [snapshot (when snapshot-store
                    (p/load-snapshot snapshot-store entity-type entity-id {}))
         initial-state (behavior/initialize-state entity-spec entity-id snapshot)]
-    (actor/create-actor entity-type entity-id entity-spec snapshot-store initial-state)))
+    (actor/create-actor entity-type entity-id entity-spec snapshot-store initial-state effect-ctx)))
 
-(defrecord ActorEngine [entity-specs snapshot-store active-map watchdog-stop-p options]
+(defrecord ActorEngine [entity-specs snapshot-store active-map watchdog-stop-p effect-ctx-atom options]
   p/ActorRuntime
   (active-actors [_ _opts]
     (reduce (fn [acc [k act]]
-              (assoc acc k {:entity-type (:entity-type act)
-                            :entity-id (:entity-id act)
-                            :status (:status @(:state-atom act))
-                            :messages-processed (:messages-processed @(:state-atom act))
-                            :last-active-at (:last-active-at @(:state-atom act))}))
+              (let [st @(:state-atom act)]
+                (assoc acc k {:entity-type (:entity-type act)
+                              :entity-id (:entity-id act)
+                              :status (:status st)
+                              :messages-processed (:messages-processed st)
+                              :last-sequence (:last-sequence st)
+                              :last-active-at (:last-active-at st)})))
             {}
             active-map))
 
@@ -53,7 +56,11 @@
                       k
                       (reify Function
                         (apply [_ _]
-                          (activate-actor! entity-type entity-id spec (:snapshot-store engine)))))))
+                          (activate-actor! entity-type
+                                           entity-id
+                                           spec
+                                           (:snapshot-store engine)
+                                           @(:effect-ctx-atom engine)))))))
 
 (defn dispatch-envelope!
   "Dispatches an envelope to an entity actor, activating it if necessary."
@@ -61,19 +68,69 @@
   (let [act (get-or-activate! engine entity-type entity-id)]
     (actor/send-envelope! act envelope)))
 
+(defn sweep-idle-actors!
+  "Deterministically runs one passivation sweep at `(time/now-ms)` and returns passivated entity keys."
+  [^ActorEngine engine]
+  (let [now (time/now-ms)
+        default-timeout-ms (get-in engine [:options :default-idle-timeout-ms] 300000)
+        idle-keys (pass/find-idle-actors (:active-map engine) now default-timeout-ms)]
+    (doseq [[e-type e-id] idle-keys]
+      (try
+        (p/passivate-entity! engine e-type e-id {})
+        (catch Throwable _t nil)))
+    idle-keys))
+
+(defn- dispatch-due-ticks!
+  [^ConcurrentHashMap active-map now-ms]
+  (doseq [[_k act] active-map]
+    (when-let [tick-ms (get-in act [:spec :tick-interval-ms])]
+      (let [last-tick (or (actor/last-tick-at act) 0)]
+        (when (>= (- now-ms (long last-tick)) (long tick-ms))
+          (actor/send-envelope! act {:type :message
+                                     :payload {:type :tick :timestamp now-ms}
+                                     :timestamp now-ms}))))))
+
+(defn trigger-tick!
+  "Synchronously sends a `{:type :tick}` message to a specific active actor or all active actors,
+   awaiting completion for deterministic testing."
+  ([^ActorEngine engine]
+   (let [now (time/now-ms)
+         acts (vec (vals (:active-map engine)))
+         promises (mapv (fn [act]
+                          (let [pr (promise)]
+                            (actor/send-envelope! act {:type :message
+                                                       :payload {:type :tick :timestamp now}
+                                                       :timestamp now
+                                                       :reply-fn #(deliver pr %)})
+                            pr))
+                        acts)]
+     (mapv #(deref % 5000 {:timeout true}) promises)))
+  ([^ActorEngine engine entity-type entity-id]
+   (let [act (get-or-activate! engine entity-type entity-id)
+         now (time/now-ms)
+         pr (promise)]
+     (actor/send-envelope! act {:type :message
+                                :payload {:type :tick :timestamp now}
+                                :timestamp now
+                                :reply-fn #(deliver pr %)})
+     (deref pr 5000 {:timeout true}))))
+
+(defn flush-actor!
+  "Synchronously flushes an active actor's state to its SnapshotStore."
+  [^ActorEngine engine entity-type entity-id]
+  (when-let [act (.get ^ConcurrentHashMap (:active-map engine) (entity-key entity-type entity-id))]
+    (actor/flush-actor! act (get-in engine [:options :stop-timeout-ms] 5000))))
+
 (defn- start-passivation-watchdog!
-  [^ConcurrentHashMap active-map passivate-fn default-timeout-ms interval-ms stop-p]
+  [^ActorEngine engine interval-ms stop-p]
   (Thread/startVirtualThread
-   (fn []
+   (bound-fn []
      (loop []
        (let [stopped? (deref stop-p interval-ms nil)]
          (when-not stopped?
-           (let [now (System/currentTimeMillis)
-                 idle-keys (pass/find-idle-actors active-map now default-timeout-ms)]
-             (doseq [[e-type e-id] idle-keys]
-               (try
-                 (passivate-fn e-type e-id {})
-                 (catch Throwable _t nil))))
+           (let [now (time/now-ms)]
+             (dispatch-due-ticks! (:active-map engine) now)
+             (sweep-idle-actors! engine))
            (recur)))))))
 
 (defn create-actor-engine
@@ -87,15 +144,13 @@
      (behavior/validate-entity-spec! spec))
    (let [active-map (ConcurrentHashMap.)
          stop-p (promise)
-         default-idle-timeout (get options :default-idle-timeout-ms 300000)
          interval-ms (get options :watchdog-interval-ms 1000)
-         engine (->ActorEngine entity-specs snapshot-store active-map stop-p options)]
-     (start-passivation-watchdog! active-map
-                                 (fn [e-type e-id opts]
-                                   (p/passivate-entity! engine e-type e-id opts))
-                                 default-idle-timeout
-                                 interval-ms
-                                 stop-p)
+         effect-ctx-atom (atom (:effect-ctx options {}))
+         engine (->ActorEngine entity-specs snapshot-store active-map stop-p effect-ctx-atom options)]
+     (swap! effect-ctx-atom assoc
+            :engine engine
+            :dispatch-fn (fn [t id env] (dispatch-envelope! engine t id env)))
+     (start-passivation-watchdog! engine interval-ms stop-p)
      engine)))
 
 (defn stop-actor-engine!

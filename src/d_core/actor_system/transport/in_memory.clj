@@ -8,7 +8,7 @@
       (if (seq handlers)
         (do
           (doseq [h (vals handlers)]
-            (Thread/startVirtualThread #(h entity-type entity-id envelope)))
+            (Thread/startVirtualThread (bound-fn [] (h entity-type entity-id envelope))))
           true)
         (throw (ex-info (str "No subscriber registered for entity type: " entity-type)
                         {:entity-type entity-type :entity-id entity-id})))))
@@ -23,7 +23,7 @@
         (do
           ;; Route to first available handler
           (let [h (first (vals handlers))]
-            (Thread/startVirtualThread #(h entity-type entity-id envelope-with-reply)))
+            (Thread/startVirtualThread (bound-fn [] (h entity-type entity-id envelope-with-reply))))
           (let [res (deref p timeout-ms {:error :timeout :timeout-ms timeout-ms})]
             (if (= :timeout (:error res))
               (throw (ex-info (str "Actor request timed out after " timeout-ms "ms")

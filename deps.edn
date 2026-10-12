@@ -1,6 +1,9 @@
 {:paths ["src"]
- :deps {;; Shared d-core-std foundation
+ :deps {;; Shared d-core foundation libraries
         org.clojars.cinguilherme/d-core-std {:local/root "../d-core-std"}
+        org.clojars.cinguilherme/d-core-grpc {:local/root "../d-core-grpc"}
+        org.clojars.cinguilherme/d-core-db {:local/root "../d-core-db"}
+        d-core/d-core-async-proxy {:local/root "../d-core-async-proxy"}
 
         ;; Clojure core
         org.clojure/clojure {:mvn/version "1.12.3"}

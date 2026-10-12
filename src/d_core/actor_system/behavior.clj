@@ -7,7 +7,9 @@
    [:init-fn fn?]
    [:step-fn fn?]
    [:idle-timeout-ms {:optional true} pos-int?]
-   [:snapshot-every-n {:optional true} pos-int?]])
+   [:snapshot-every-n {:optional true} pos-int?]
+   [:tick-interval-ms {:optional true} pos-int?]
+   [:effect-handler {:optional true} fn?]])
 
 (def default-options
   {:idle-timeout-ms 300000       ;; 5 minutes
