@@ -19,10 +19,15 @@
         e-type (keyword (or (:entity-type payload) :unknown))
         e-id (str (or (:entity-id payload) (:key delivery-env)))
         raw-env (or (:envelope payload) {:type :message :payload payload})
+        produced-at (or (:produced-at delivery-env)
+                        (get-in delivery-env [:metadata :timestamp])
+                        (:timestamp raw-env)
+                        (:timestamp delivery-env))
         reply-p (promise)
-        env-with-reply (assoc raw-env
-                              :sequence (:delivery-id delivery-env)
-                              :reply-fn #(deliver reply-p %))]
+        env-with-reply (cond-> (assoc raw-env
+                                      :sequence (:delivery-id delivery-env)
+                                      :reply-fn #(deliver reply-p %))
+                         produced-at (assoc :produced-at produced-at))]
     (handler-fn e-type e-id env-with-reply)
     (let [reply-val (deref reply-p (long (or step-timeout-ms 5000)) ::timeout)]
       (if (= reply-val ::timeout)
@@ -43,7 +48,7 @@
                      (cond-> {:topic topic
                               :key (str entity-id)}
                        (:partitions merged) (assoc :partitions (:partitions merged))
-                       (:partition merged) (assoc :partition (:partition merged))))
+                       (:target-partition opts) (assoc :partition (:target-partition opts))))
       true))
 
   (request-message! [_ entity-type entity-id envelope opts]
@@ -60,7 +65,7 @@
                          :key (str entity-id)
                          :timeout-ms timeout-ms}
                   (:partitions merged) (assoc :partitions (:partitions merged))
-                  (:partition merged) (assoc :partition (:partition merged))))]
+                  (:target-partition opts) (assoc :partition (:target-partition opts))))]
       (case (:status resp)
         :ok (:reply resp)
         :timeout (throw (ex-info (str "Actor request timed out after " timeout-ms "ms")

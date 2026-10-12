@@ -3,6 +3,7 @@
             [d-core.actor-system.protocols :as p]
             [d-core.actor-system.runtime.actor :as actor]
             [d-core.actor-system.runtime.passivation :as pass]
+            [d-core.core.metrics.wrappers :as wrappers]
             [d-core.libs.time :as time])
   (:import [java.util.concurrent ConcurrentHashMap]
            [java.util.function Function]))
@@ -145,7 +146,15 @@
    (let [active-map (ConcurrentHashMap.)
          stop-p (promise)
          interval-ms (get options :watchdog-interval-ms 1000)
-         effect-ctx-atom (atom (:effect-ctx options {}))
+         base-eff-ctx (:effect-ctx options {})
+         metrics (or (:metrics options) (:metrics base-eff-ctx))
+         actor-inst (when metrics
+                      (or (:actor-instruments base-eff-ctx)
+                          (wrappers/actor-instruments metrics)))
+         eff-ctx (cond-> base-eff-ctx
+                   metrics (assoc :metrics metrics
+                                  :actor-instruments actor-inst))
+         effect-ctx-atom (atom eff-ctx)
          engine (->ActorEngine entity-specs snapshot-store active-map stop-p effect-ctx-atom options)]
      (swap! effect-ctx-atom assoc
             :engine engine

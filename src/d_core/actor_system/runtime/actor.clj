@@ -1,6 +1,7 @@
 (ns d-core.actor-system.runtime.actor
   (:require [d-core.actor-system.behavior :as behavior]
             [d-core.actor-system.protocols :as p]
+            [d-core.core.metrics.wrappers :as wrappers]
             [d-core.core.producers.protocol :as prod]
             [d-core.libs.time :as time])
   (:import [java.util.concurrent LinkedTransferQueue]))
@@ -12,27 +13,38 @@
    :now (time/now-ms)
    :instant (time/now)})
 
+(defn- record-snapshot-metric!
+  [{:keys [metrics actor-instruments]} entity-type]
+  (when (and metrics actor-instruments)
+    (wrappers/record-actor-snapshot! metrics actor-instruments entity-type)))
+
 (defn- persist-snapshot-if-needed!
-  [snapshot-store entity-type entity-id spec state count last-seq]
+  [snapshot-store entity-type entity-id spec state count last-seq effect-ctx]
   (when (and snapshot-store (behavior/should-snapshot? spec count))
     (try
       (p/save-snapshot! snapshot-store entity-type entity-id state
                         (cond-> {:messages-processed count}
                           last-seq (assoc :sequence last-seq)))
+      (record-snapshot-metric! effect-ctx entity-type)
       (catch Throwable _t
         nil))))
 
+(defn- extract-effect-map
+  [effect]
+  (cond
+    (map? effect) effect
+    (vector? effect) (let [[t a b c] effect]
+                       (case t
+                         :tell {:type :tell :entity-type a :entity-id b :message c}
+                         :publish {:type :publish :topic a :message b :options c}
+                         {:type t :args (vec (rest effect))}))
+    :else {:type effect}))
+
 (defn- execute-single-effect!
   [{:keys [entity-type entity-id spec snapshot-store effect-ctx]} next-state effect]
-  (let [eff-map (cond
-                  (map? effect) effect
-                  (vector? effect) (let [[t a b c] effect]
-                                     (case t
-                                       :tell {:type :tell :entity-type a :entity-id b :message c}
-                                       :publish {:type :publish :topic a :message b :options c}
-                                       {:type t :args (vec (rest effect))}))
-                  :else {:type effect})
+  (let [eff-map (extract-effect-map effect)
         eff-type (:type eff-map)
+        {:keys [metrics actor-instruments]} effect-ctx
         custom-handler (or (:effect-handler spec) (:effect-handler effect-ctx))]
     (try
       (case eff-type
@@ -70,7 +82,8 @@
         (:snapshot :flush-snapshot)
         (when snapshot-store
           (p/save-snapshot! snapshot-store entity-type entity-id next-state
-                            (or (:opts eff-map) {})))
+                            (or (:opts eff-map) {}))
+          (record-snapshot-metric! effect-ctx entity-type))
 
         (:fn :custom)
         (if-let [f (:fn eff-map)]
@@ -90,7 +103,11 @@
                                    :entity-id entity-id
                                    :state next-state
                                    :effect-ctx effect-ctx})))
+      (when (and metrics actor-instruments)
+        (wrappers/record-actor-effect! metrics actor-instruments eff-type :ok))
       (catch Throwable _t
+        (when (and metrics actor-instruments)
+          (wrappers/record-actor-effect! metrics actor-instruments eff-type :error))
         nil))))
 
 (defn- execute-effects!
@@ -99,10 +116,19 @@
     (doseq [eff effects]
       (execute-single-effect! actor next-state eff))))
 
+(defn- extract-message-op
+  [payload]
+  (if (map? payload)
+    (or (:type payload) (:op payload) :message)
+    :message))
+
 (defn- process-message-envelope!
   [actor envelope]
-  (let [{:keys [entity-type entity-id spec snapshot-store state-atom]} actor
+  (let [start-nanos (System/nanoTime)
+        {:keys [entity-type entity-id spec snapshot-store state-atom effect-ctx]} actor
+        {:keys [metrics actor-instruments]} effect-ctx
         {:keys [payload reply-fn context sequence]} envelope
+        op (extract-message-op payload)
         current-state (:state @state-atom)
         now (time/now-ms)
         ctx (merge (build-actor-context entity-type entity-id)
@@ -112,7 +138,11 @@
         next-state (:next-state step-result)
         reply (:reply step-result)
         effects (:effects step-result)
-        tick-msg? (and (map? payload) (= :tick (:type payload)))
+        tick-msg? (= :tick op)
+        produced-at (or (:produced-at envelope) (:timestamp envelope))
+        step-status (if (and (map? reply) (= :rejected (:status reply)))
+                      :rejected
+                      :ok)
         updated-meta (swap! state-atom
                             (fn [curr]
                               (let [new-count (inc (get curr :messages-processed 0))]
@@ -122,6 +152,13 @@
                                                :last-active-at now)
                                   sequence (assoc :last-sequence sequence)
                                   tick-msg? (assoc :last-tick-at now)))))]
+    (when (and metrics actor-instruments)
+      (wrappers/record-actor-step! metrics actor-instruments entity-type op step-status
+                                   (wrappers/duration-seconds start-nanos))
+      (when (and (not tick-msg?) (number? produced-at))
+        (wrappers/record-actor-transit-lag!
+         metrics actor-instruments entity-type op
+         (/ (double (max 0 (- now (long produced-at)))) 1000.0))))
     (execute-effects! actor next-state effects)
     (when reply-fn
       (try
@@ -133,16 +170,18 @@
                                  spec
                                  next-state
                                  (:messages-processed updated-meta)
-                                 (:last-sequence updated-meta))))
+                                 (:last-sequence updated-meta)
+                                 effect-ctx)))
 
 (defn- handle-flush-envelope!
-  [{:keys [entity-type entity-id snapshot-store state-atom]} {:keys [reply-fn]}]
+  [{:keys [entity-type entity-id snapshot-store state-atom effect-ctx]} {:keys [reply-fn]}]
   (let [curr @state-atom]
     (when snapshot-store
       (try
         (p/save-snapshot! snapshot-store entity-type entity-id (:state curr)
                           (cond-> {:messages-processed (:messages-processed curr)}
                             (:last-sequence curr) (assoc :sequence (:last-sequence curr))))
+        (record-snapshot-metric! effect-ctx entity-type)
         (catch Throwable _t nil)))
     (when reply-fn
       (reply-fn {:ok true
@@ -170,7 +209,8 @@
 
 (defn- actor-loop
   [actor]
-  (let [{:keys [mailbox state-atom snapshot-store entity-type entity-id]} actor]
+  (let [{:keys [mailbox state-atom snapshot-store entity-type entity-id effect-ctx]} actor
+        {:keys [metrics actor-instruments]} effect-ctx]
     (try
       (loop []
         (when (= :running (:status @state-atom))
@@ -184,8 +224,11 @@
             (let [curr @state-atom]
               (p/save-snapshot! snapshot-store entity-type entity-id (:state curr)
                                 (cond-> {:messages-processed (:messages-processed curr)}
-                                  (:last-sequence curr) (assoc :sequence (:last-sequence curr)))))
+                                  (:last-sequence curr) (assoc :sequence (:last-sequence curr))))
+              (record-snapshot-metric! effect-ctx entity-type))
             (catch Throwable _t nil)))
+        (when (and metrics actor-instruments)
+          (wrappers/record-actor-stop! metrics actor-instruments entity-type))
         (swap! state-atom assoc :status :stopped)))))
 
 (defn create-actor
@@ -195,6 +238,8 @@
   ([entity-type entity-id spec snapshot-store initial-state effect-ctx]
    (let [mailbox (LinkedTransferQueue.)
          now (time/now-ms)
+         eff-ctx (or effect-ctx {})
+         {:keys [metrics actor-instruments]} eff-ctx
          state-atom (atom {:state initial-state
                            :messages-processed 0
                            :last-active-at now
@@ -205,9 +250,11 @@
                 :entity-id entity-id
                 :spec spec
                 :snapshot-store snapshot-store
-                :effect-ctx (or effect-ctx {})
+                :effect-ctx eff-ctx
                 :mailbox mailbox
                 :state-atom state-atom}
+         _ (when (and metrics actor-instruments)
+             (wrappers/record-actor-spawn! metrics actor-instruments entity-type))
          thread (Thread/startVirtualThread (bound-fn [] (actor-loop actor)))]
      (assoc actor :thread thread))))
 

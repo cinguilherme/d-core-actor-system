@@ -73,17 +73,20 @@
    - :entities  (map of {entity-type entity-spec})
    - :producer  (optional ProducerProtocol for :publish effects)
    - :db        (optional database handle for custom effects)
+   - :metrics   (optional MetricsProtocol for actor instrumentation)
    - :effect-handler (optional fn [effect ctx] for custom effects)
    - :options   (e.g. :default-idle-timeout-ms, :watchdog-interval-ms, :partition, :partitions)"
-  [{:keys [transport storage entities producer db effect-handler options]}]
+  [{:keys [transport storage entities producer db metrics effect-handler options]}]
   (let [actual-storage (or storage (in-mem-storage/create-in-memory-snapshot-store))
         actual-transport (or transport (in-mem-transport/create-in-memory-transport))
-        effect-ctx (merge {:transport actual-transport
-                           :storage actual-storage
-                           :producer producer
-                           :db db
-                           :effect-handler effect-handler}
-                          (:effect-ctx options))
+        eff-metrics (or metrics (:metrics options))
+        effect-ctx (cond-> (merge {:transport actual-transport
+                                   :storage actual-storage
+                                   :producer producer
+                                   :db db
+                                   :effect-handler effect-handler}
+                                  (:effect-ctx options))
+                     eff-metrics (assoc :metrics eff-metrics))
         engine-opts (assoc (or options {}) :effect-ctx effect-ctx)
         engine (engine/create-actor-engine entities actual-storage engine-opts)
         subs (subscribe-all-entities! actual-transport engine entities (or options {}))]
