@@ -28,21 +28,31 @@
         received-at (time/now-ms)
         meta-info (merge (or (:metadata delivery-env) {})
                          (or (:metadata raw-env) {}))
-        reply-p (promise)
+        reply-expected? (boolean
+                         (or (:reply-expected? meta-info)
+                             (:reply-expected? delivery-env)
+                             (:sync? delivery-env)
+                             (:correlation-id delivery-env)
+                             (:correlation-id meta-info)
+                             (:reply-to delivery-env)
+                             (:reply-to meta-info)))
+        reply-p (when reply-expected? (promise))
         env-with-reply (cond-> (assoc raw-env
                                       :sequence (:delivery-id delivery-env)
-                                      :reply-fn #(deliver reply-p %)
                                       :metadata meta-info
                                       :received-at received-at)
+                         reply-p (assoc :reply-fn #(deliver reply-p %))
                          produced-at (assoc :produced-at produced-at)
                          pulled-at (assoc :pulled-at pulled-at))]
     (handler-fn e-type e-id env-with-reply)
-    (let [reply-val (deref reply-p (long (or step-timeout-ms 5000)) ::timeout)]
-      (if (= reply-val ::timeout)
-        {:disposition :retry
-         :error "Timed out waiting for local actor step completion"}
-        {:disposition :ack
-         :reply reply-val}))))
+    (if-not reply-expected?
+      {:disposition :ack}
+      (let [reply-val (deref reply-p (long (or step-timeout-ms 5000)) ::timeout)]
+        (if (= reply-val ::timeout)
+          {:disposition :retry
+           :error "Timed out waiting for local actor step completion"}
+          {:disposition :ack
+           :reply reply-val})))))
 
 (defrecord AsyncProxyTransport [grpc-client producer owns-client? options]
   p/ActorTransport
