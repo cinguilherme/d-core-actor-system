@@ -5,7 +5,8 @@
   (:require [d-core.actor-system.protocols :as p]
             [d-core.core.consumers.async-proxy :as ap-cons]
             [d-core.core.producers.async-proxy :as ap-prod]
-            [d-core.core.producers.protocol :as prod]))
+            [d-core.core.producers.protocol :as prod]
+            [d-core.libs.time :as time]))
 
 (defn entity-topic
   "Constructs the topic keyword for an entity type, e.g. `:actor.precinct`."
@@ -23,11 +24,18 @@
                         (get-in delivery-env [:metadata :timestamp])
                         (:timestamp raw-env)
                         (:timestamp delivery-env))
+        pulled-at (:pulled-at delivery-env)
+        received-at (time/now-ms)
+        meta-info (merge (or (:metadata delivery-env) {})
+                         (or (:metadata raw-env) {}))
         reply-p (promise)
         env-with-reply (cond-> (assoc raw-env
                                       :sequence (:delivery-id delivery-env)
-                                      :reply-fn #(deliver reply-p %))
-                         produced-at (assoc :produced-at produced-at))]
+                                      :reply-fn #(deliver reply-p %)
+                                      :metadata meta-info
+                                      :received-at received-at)
+                         produced-at (assoc :produced-at produced-at)
+                         pulled-at (assoc :pulled-at pulled-at))]
     (handler-fn e-type e-id env-with-reply)
     (let [reply-val (deref reply-p (long (or step-timeout-ms 5000)) ::timeout)]
       (if (= reply-val ::timeout)

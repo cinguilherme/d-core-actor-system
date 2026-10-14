@@ -1,6 +1,7 @@
 (ns d-core.actor-system.runtime.actor
   (:require [d-core.actor-system.behavior :as behavior]
             [d-core.actor-system.protocols :as p]
+            [d-core.core.metrics.tracing :as otel]
             [d-core.core.metrics.wrappers :as wrappers]
             [d-core.core.producers.protocol :as prod]
             [d-core.libs.time :as time])
@@ -124,54 +125,69 @@
 
 (defn- process-message-envelope!
   [actor envelope]
-  (let [start-nanos (System/nanoTime)
+  (let [now (time/now-ms)
+        start-nanos (System/nanoTime)
         {:keys [entity-type entity-id spec snapshot-store state-atom effect-ctx]} actor
         {:keys [metrics actor-instruments]} effect-ctx
-        {:keys [payload reply-fn context sequence]} envelope
+        {:keys [payload reply-fn context sequence metadata produced-at pulled-at received-at enqueued-at]} envelope
         op (extract-message-op payload)
-        current-state (:state @state-atom)
-        now (time/now-ms)
-        ctx (merge (build-actor-context entity-type entity-id)
-                   context
-                   (when sequence {:sequence sequence}))
-        step-result (behavior/execute-step spec current-state payload ctx)
-        next-state (:next-state step-result)
-        reply (:reply step-result)
-        effects (:effects step-result)
-        tick-msg? (= :tick op)
-        produced-at (or (:produced-at envelope) (:timestamp envelope))
-        step-status (if (and (map? reply) (= :rejected (:status reply)))
-                      :rejected
-                      :ok)
-        updated-meta (swap! state-atom
-                            (fn [curr]
-                              (let [new-count (inc (get curr :messages-processed 0))]
-                                (cond-> (assoc curr
-                                               :state next-state
-                                               :messages-processed new-count
-                                               :last-active-at now)
-                                  sequence (assoc :last-sequence sequence)
-                                  tick-msg? (assoc :last-tick-at now)))))]
-    (when (and metrics actor-instruments)
-      (wrappers/record-actor-step! metrics actor-instruments entity-type op step-status
-                                   (wrappers/duration-seconds start-nanos))
-      (when (and (not tick-msg?) (number? produced-at))
-        (wrappers/record-actor-transit-lag!
-         metrics actor-instruments entity-type op
-         (/ (double (max 0 (- now (long produced-at)))) 1000.0))))
-    (execute-effects! actor next-state effects)
-    (when reply-fn
-      (try
-        (reply-fn reply)
-        (catch Throwable _t nil)))
-    (persist-snapshot-if-needed! snapshot-store
-                                 entity-type
-                                 entity-id
-                                 spec
-                                 next-state
-                                 (:messages-processed updated-meta)
-                                 (:last-sequence updated-meta)
-                                 effect-ctx)))
+        carrier (or metadata (:metadata payload) context)
+        mailbox-wait-ms (if enqueued-at (max 0 (- now (long enqueued-at))) 0)
+        broker-transit-ms (if (and produced-at pulled-at) (max 0 (- (long pulled-at) (long produced-at))) 0)
+        proxy-transit-ms (if (and pulled-at received-at) (max 0 (- (long received-at) (long pulled-at))) 0)
+        total-transit-ms (if produced-at (max 0 (- now (long produced-at))) 0)]
+    (otel/with-span [nil "actor.step_execute"
+                     {:carrier carrier
+                      :kind :internal
+                      :attributes {"entity.type" (name entity-type)
+                                   "entity.id" (str entity-id)
+                                   "op" (name op)
+                                   "transit_lag_ms" total-transit-ms
+                                   "mailbox_wait_ms" mailbox-wait-ms
+                                   "broker_transit_ms" broker-transit-ms
+                                   "proxy_transit_ms" proxy-transit-ms}}]
+      (let [current-state (:state @state-atom)
+            ctx (merge (build-actor-context entity-type entity-id)
+                       context
+                       (when sequence {:sequence sequence}))
+            step-result (behavior/execute-step spec current-state payload ctx)
+            next-state (:next-state step-result)
+            reply (:reply step-result)
+            effects (:effects step-result)
+            tick-msg? (= :tick op)
+            eff-produced-at (or produced-at (:timestamp envelope))
+            step-status (if (and (map? reply) (= :rejected (:status reply)))
+                          :rejected
+                          :ok)
+            updated-meta (swap! state-atom
+                                (fn [curr]
+                                  (let [new-count (inc (get curr :messages-processed 0))]
+                                    (cond-> (assoc curr
+                                                   :state next-state
+                                                   :messages-processed new-count
+                                                   :last-active-at now)
+                                      sequence (assoc :last-sequence sequence)
+                                      tick-msg? (assoc :last-tick-at now)))))]
+        (when (and metrics actor-instruments)
+          (wrappers/record-actor-step! metrics actor-instruments entity-type op step-status
+                                       (wrappers/duration-seconds start-nanos))
+          (when (and (not tick-msg?) (number? eff-produced-at))
+            (wrappers/record-actor-transit-lag!
+             metrics actor-instruments entity-type op
+             (/ (double (max 0 (- now (long eff-produced-at)))) 1000.0))))
+        (execute-effects! actor next-state effects)
+        (when reply-fn
+          (try
+            (reply-fn reply)
+            (catch Throwable _t nil)))
+        (persist-snapshot-if-needed! snapshot-store
+                                     entity-type
+                                     entity-id
+                                     spec
+                                     next-state
+                                     (:messages-processed updated-meta)
+                                     (:last-sequence updated-meta)
+                                     effect-ctx)))))
 
 (defn- handle-flush-envelope!
   [{:keys [entity-type entity-id snapshot-store state-atom effect-ctx]} {:keys [reply-fn]}]
@@ -261,7 +277,10 @@
 (defn send-envelope!
   "Puts an envelope into the actor mailbox."
   [actor envelope]
-  (.offer ^LinkedTransferQueue (:mailbox actor) envelope))
+  (let [env-to-send (if (contains? envelope :enqueued-at)
+                      envelope
+                      (assoc envelope :enqueued-at (time/now-ms)))]
+    (.offer ^LinkedTransferQueue (:mailbox actor) env-to-send)))
 
 (defn stop-actor!
   "Sends a stop envelope and waits for actor termination up to timeout-ms."
