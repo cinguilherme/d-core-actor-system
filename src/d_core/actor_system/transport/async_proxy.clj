@@ -100,13 +100,25 @@
           topic (entity-topic (:topic-prefix merged) entity-type)
           part (:partition merged)
           parts (:partitions merged)
+          ;; Deterministic id, deliberately NOT suffixed with a random uuid.
+          ;; This value labels the proxy's async_proxy_queue_depth gauge, so a
+          ;; random suffix mints a brand-new Prometheus series on every reconnect
+          ;; and abandons the old one -- which keeps reporting its last value for
+          ;; the whole staleness window. That is how a fully drained queue still
+          ;; summed to ~14k "queued" messages and made the consumers look stuck.
+          ;; entity-type + partition is unique per deployment (partitions are
+          ;; split across the actor nodes), so it is stable *and* collision-free.
           sub-id (keyword (str "actor-" (name entity-type)
-                               (when (some? part) (str "-p" part))
-                               "-" (subs (str (random-uuid)) 0 8)))
+                               (when (some? part) (str "-p" part))))
           mode (or (:mode merged) (:delivery-mode merged) :stream)
           step-timeout-ms (or (:step-timeout-ms merged) 5000)
           consumer (ap-cons/start-consumer
                     {:grpc-client grpc-client
+                     ;; Pass a logger through so stream disconnects and
+                     ;; reconnects are visible; without one the consumer
+                     ;; reconnects silently (or, before reconnection existed,
+                     ;; did not reconnect at all and said nothing).
+                     :logger (:logger merged)
                      :subscriptions
                      {sub-id (cond-> {:subscription-id sub-id
                                       :topic topic
