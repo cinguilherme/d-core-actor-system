@@ -63,6 +63,19 @@
                                            (:snapshot-store engine)
                                            @(:effect-ctx-atom engine)))))))
 
+(defn peek-state
+  "Returns the committed state of an ALREADY ACTIVE actor, or nil when the entity
+   is not loaded.
+
+   Deliberately never activates: answering a read must not create an actor or
+   load a snapshot as a side effect. It also does not touch the mailbox, which is
+   the point -- a read routed through the mailbox queues behind every message in
+   flight, which is what turned a 6ms read into a 5s timeout under load."
+  [^ActorEngine engine entity-type entity-id]
+  (when-let [act (.get ^ConcurrentHashMap (:active-map engine)
+                       (entity-key entity-type entity-id))]
+    (get-in @(:state-atom act) [:state])))
+
 (defn dispatch-envelope!
   "Dispatches an envelope to an entity actor, activating it if necessary."
   [^ActorEngine engine entity-type entity-id envelope]

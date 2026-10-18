@@ -7,7 +7,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [d-core.actor-system.protocols :as p]
             [d-core.actor-system.transport.async-proxy :as ap-transport]
-            [d-core.core.consumers.async-proxy :as ap-cons]))
+            [d-core.core.consumers.async-proxy :as ap-cons]
+            [d-core.actor-system.behavior :as behavior]
+            [d-core.actor-system.runtime.engine :as engine]))
 
 (defn- deliver!
   "Calls the private delivery adapter the way the consumer does."
@@ -55,3 +57,15 @@
           (is (= 4 (:partitions spec))))
         (testing "the drain callback is forwarded, so a handoff can wait on it"
           (is (identical? on-drained (:on-drained spec))))))))
+
+(deftest peek-state-reads-without-activating
+  ;; The read lane answers from memory; peek-state must never create an actor or
+  ;; load a snapshot as a side effect of a read.
+  (let [spec {:init-fn (fn [_] {:hits 0})
+              :step-fn (fn [s _ _] [s {:ok true} []])}
+        engine (engine/create-actor-engine {:thing spec})]
+    (is (nil? (engine/peek-state engine :thing "t1"))
+        "an inactive entity is not peeked into existence")
+    (engine/dispatch-envelope! engine :thing "t1" {:type :message :payload {:type :noop}})
+    (is (some? (engine/peek-state engine :thing "t1"))
+        "an active entity exposes its committed state")))

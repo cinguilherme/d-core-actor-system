@@ -100,6 +100,10 @@
       (prod/produce! producer msg
                      (cond-> {:topic topic
                               :key (str entity-id)}
+                       ;; Forward the publish semantics. Without this a caller that
+                       ;; asked for a fire-and-forget publish still paid the broker
+                       ;; ack: the proxy defaults :sync? to true.
+                       (contains? merged :sync?) (assoc :sync? (:sync? merged))
                        (:partitions merged) (assoc :partitions (:partitions merged))
                        (:target-partition opts) (assoc :partition (:target-partition opts))))
       true))
