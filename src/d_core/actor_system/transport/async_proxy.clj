@@ -2,7 +2,8 @@
   "Distributed ActorTransport implementation backed by d-core-async-proxy over gRPC.
    Provides deterministic key-based partition sharding (`entity-id -> partition`)
    and bridges both asynchronous `tell!` and synchronous `ask!` (`RequestReply`)."
-  (:require [d-core.actor-system.protocols :as p]
+  (:require [clojure.string :as str]
+            [d-core.actor-system.protocols :as p]
             [d-core.core.consumers.async-proxy :as ap-cons]
             [d-core.core.producers.async-proxy :as ap-prod]
             [d-core.core.producers.protocol :as prod]
@@ -13,6 +14,27 @@
   [topic-prefix entity-type]
   (let [prefix (or topic-prefix "actor")]
     (keyword (str (name prefix) "." (name entity-type)))))
+
+(defn- lane-topic
+  "Applies a lane suffix to an entity topic: `:actor.precinct` + \".read\" ->
+   `:actor.precinct.read`.
+
+   The suffix rides on the topic, so the proxy partitions it exactly like the
+   default lane (`actor.precinct.read.p5`) and gives it its own durable. That is
+   what stops a read from queueing behind the ballot backlog."
+  [topic suffix]
+  (if (str/blank? (str suffix))
+    topic
+    (keyword (str (name topic) suffix))))
+
+(defn- lane-sub-id
+  "Subscription id for a lane. It labels queue-depth and in-flight-age gauges, so
+   it has to be stable and distinct per lane rather than random."
+  [entity-type partition suffix]
+  (keyword (str "actor-" (name entity-type)
+                (when-not (str/blank? (str suffix))
+                  (str "-" (str/replace (str suffix) #"[^a-zA-Z0-9]+" "")))
+                (when (some? partition) (str "-p" partition)))))
 
 (defn- handle-proxy-delivery
   [handler-fn delivery-env step-timeout-ms]
@@ -37,13 +59,25 @@
                              (:reply-to delivery-env)
                              (:reply-to meta-info)))
         reply-p (when reply-expected? (promise))
+        ;; Ownership epoch, stamped by the proxy when it enforced the lease.
+        ;;
+        ;; It must reach the STEP, not just the envelope: the only thing that
+        ;; stops a former owner from overwriting the new owner's state is the
+        ;; write being guarded by this value. The proxy cannot do that for us, and
+        ;; the broker cannot either -- it has already delivered the message.
+        fencing (:fencing delivery-env)
         env-with-reply (cond-> (assoc raw-env
                                       :sequence (:delivery-id delivery-env)
                                       :metadata meta-info
                                       :received-at received-at)
                          reply-p (assoc :reply-fn #(deliver reply-p %))
                          produced-at (assoc :produced-at produced-at)
-                         pulled-at (assoc :pulled-at pulled-at))]
+                         pulled-at (assoc :pulled-at pulled-at)
+                         (some? fencing) (assoc :fencing fencing)
+                         ;; The engine merges `:context` into the step's ctx, so
+                         ;; this is how the epoch reaches the code that writes.
+                         ;; `:fencing` on the envelope alone would not be enough.
+                         (some? fencing) (update :context assoc :fencing fencing))]
     (handler-fn e-type e-id env-with-reply)
     (if-not reply-expected?
       {:disposition :ack}
@@ -58,7 +92,8 @@
   p/ActorTransport
   (send-message! [_ entity-type entity-id envelope opts]
     (let [merged (merge options opts)
-          topic (entity-topic (:topic-prefix merged) entity-type)
+          topic (lane-topic (entity-topic (:topic-prefix merged) entity-type)
+                            (:topic-suffix merged))
           msg {:entity-type (keyword entity-type)
                :entity-id (str entity-id)
                :envelope (dissoc envelope :reply-fn)}]
@@ -72,7 +107,8 @@
   (request-message! [_ entity-type entity-id envelope opts]
     (let [merged (merge options opts)
           timeout-ms (long (or (:timeout-ms merged) 5000))
-          topic (entity-topic (:topic-prefix merged) entity-type)
+          topic (lane-topic (entity-topic (:topic-prefix merged) entity-type)
+                            (:topic-suffix merged))
           msg {:entity-type (keyword entity-type)
                :entity-id (str entity-id)
                :envelope (dissoc envelope :reply-fn)}
@@ -97,7 +133,8 @@
 
   (subscribe-entities! [_ entity-type handler-fn opts]
     (let [merged (merge options opts)
-          topic (entity-topic (:topic-prefix merged) entity-type)
+          topic (lane-topic (entity-topic (:topic-prefix merged) entity-type)
+                            (:topic-suffix merged))
           part (:partition merged)
           parts (:partitions merged)
           ;; Deterministic id, deliberately NOT suffixed with a random uuid.
@@ -108,8 +145,7 @@
           ;; summed to ~14k "queued" messages and made the consumers look stuck.
           ;; entity-type + partition is unique per deployment (partitions are
           ;; split across the actor nodes), so it is stable *and* collision-free.
-          sub-id (keyword (str "actor-" (name entity-type)
-                               (when (some? part) (str "-p" part))))
+          sub-id (lane-sub-id entity-type part (:topic-suffix merged))
           mode (or (:mode merged) (:delivery-mode merged) :stream)
           step-timeout-ms (or (:step-timeout-ms merged) 5000)
           consumer (ap-cons/start-consumer
@@ -127,7 +163,26 @@
                                                       (:subscription-options merged))
                                       :handler #(handle-proxy-delivery handler-fn % step-timeout-ms)}
                                (some? part) (assoc :partition (long part))
-                               (some? parts) (assoc :partitions (long parts)))}})]
+                               (some? parts) (assoc :partitions (long parts))
+                               ;; Consumer group, when the caller sets one. It
+                               ;; scopes the proxy-side durable, so two groups
+                               ;; reading the same topic each get every message
+                               ;; instead of splitting them. Omitted means the
+                               ;; historical ungrouped durable.
+                               (:group merged) (assoc :group (:group merged))
+                               ;; Ownership credentials, when the deployment
+                               ;; enforces ownership. The proxy validates the
+                               ;; token at subscribe time and refuses the
+                               ;; subscription otherwise, then stamps the
+                               ;; resulting fencing epoch on each delivery.
+                               (:lease-id merged) (assoc :lease-id (:lease-id merged))
+                               (:token merged) (assoc :token (:token merged))
+                               ;; Drain control. Passed through so the owner of
+                               ;; the lease can wait for a partition to finish
+                               ;; its backlog without reaching into the consumer.
+                               (:on-drained merged) (assoc :on-drained (:on-drained merged))
+                               (:on-pause-blocked merged) (assoc :on-pause-blocked
+                                                                 (:on-pause-blocked merged)))}})]
       {:entity-type (keyword entity-type)
        :subscription-id sub-id
        :consumer consumer}))

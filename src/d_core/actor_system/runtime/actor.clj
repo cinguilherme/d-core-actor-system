@@ -46,7 +46,12 @@
   (let [eff-map (extract-effect-map effect)
         eff-type (:type eff-map)
         {:keys [metrics actor-instruments]} effect-ctx
-        custom-handler (or (:effect-handler spec) (:effect-handler effect-ctx))]
+        custom-handler (or (:effect-handler spec) (:effect-handler effect-ctx))
+        ;; Timed because effects run inline, between messages: a slow one blocks
+        ;; this actor's next message, including a read. Without this histogram
+        ;; the actor's step looked fast (p99 0.4 ms) while reads still timed out,
+        ;; and there was no metric that could explain the gap.
+        eff-start (System/nanoTime)]
     (try
       (case eff-type
         :tell
@@ -105,10 +110,12 @@
                                    :state next-state
                                    :effect-ctx effect-ctx})))
       (when (and metrics actor-instruments)
-        (wrappers/record-actor-effect! metrics actor-instruments eff-type :ok))
+        (wrappers/record-actor-effect! metrics actor-instruments eff-type :ok
+                                       (wrappers/duration-seconds eff-start)))
       (catch Throwable _t
         (when (and metrics actor-instruments)
-          (wrappers/record-actor-effect! metrics actor-instruments eff-type :error))
+          (wrappers/record-actor-effect! metrics actor-instruments eff-type :error
+                                         (wrappers/duration-seconds eff-start)))
         nil))))
 
 (defn- execute-effects!
