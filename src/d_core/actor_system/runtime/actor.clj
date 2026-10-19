@@ -195,7 +195,8 @@
         eff-produced-at (or produced-at (:timestamp envelope))
         trace? (should-trace-message? op)]
     (if-not trace?
-      (execute-step-body! actor envelope now start-nanos op eff-produced-at)
+      (otel/with-unsampled-context
+        (execute-step-body! actor envelope now start-nanos op eff-produced-at))
       (let [carrier (or metadata (:metadata payload) context)
             mailbox-wait-ms (if enqueued-at (max 0 (- now (long enqueued-at))) 0)
             broker-transit-ms (if (and produced-at pulled-at) (max 0 (- (long pulled-at) (long produced-at))) 0)
