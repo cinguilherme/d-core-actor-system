@@ -43,21 +43,42 @@
                                        :entity_id (str entity-id)}
                                :limit 1})]
       (when-let [row (first rows)]
-        (decode-state (row-val row :state_payload) fmt))))
+        (let [decoded (decode-state (row-val row :state_payload) fmt)]
+          (if (map? decoded)
+            (dissoc decoded :__dcore_fencing)
+            decoded)))))
 
   (save-snapshot! [_ entity-type entity-id state opts]
     (let [table (get options :table :actor_snapshots)
           fmt (get options :format :nippy)
-          payload (encode-state state fmt)
-          seq-val (some-> (:sequence opts) str)
-          row (cond-> {:entity_type (name entity-type)
-                       :entity_id (str entity-id)
-                       :state_payload payload
-                       :updated_at (time/now-ms)}
-                seq-val (assoc :sequence_num seq-val))]
-      (sql/upsert! db row {:table table
-                           :conflict-columns [:entity_type :entity_id]})
-      state)))
+          incoming-fencing (some-> (:fencing opts) long)
+          existing-row (first (sql/select db {:table table
+                                              :where {:entity_type (name entity-type)
+                                                      :entity_id (str entity-id)}
+                                              :limit 1}))
+          existing-decoded (when existing-row
+                             (decode-state (row-val existing-row :state_payload) fmt))
+          existing-fencing (when (map? existing-decoded)
+                             (some-> (:__dcore_fencing existing-decoded) long))
+          stale? (and (some? existing-fencing)
+                      (or (nil? incoming-fencing)
+                          (< incoming-fencing existing-fencing)))]
+      (if stale?
+        (dissoc existing-decoded :__dcore_fencing)
+        (let [effective-fencing (or incoming-fencing existing-fencing)
+              state-to-encode (if (and (map? state) (some? effective-fencing))
+                                (assoc state :__dcore_fencing effective-fencing)
+                                state)
+              payload (encode-state state-to-encode fmt)
+              seq-val (some-> (:sequence opts) str)
+              row (cond-> {:entity_type (name entity-type)
+                           :entity_id (str entity-id)
+                           :state_payload payload
+                           :updated_at (time/now-ms)}
+                    seq-val (assoc :sequence_num seq-val))]
+          (sql/upsert! db row {:table table
+                               :conflict-columns [:entity_type :entity_id]})
+          state)))))
 
 (defn create-sql-snapshot-store
   "Creates a `SqlSnapshotStore` backed by any `SimpleSQLProtocol` implementation."

@@ -20,12 +20,13 @@
     (wrappers/record-actor-snapshot! metrics actor-instruments entity-type)))
 
 (defn- persist-snapshot-if-needed!
-  [snapshot-store entity-type entity-id spec state count last-seq effect-ctx]
+  [snapshot-store entity-type entity-id spec state count last-seq fencing effect-ctx]
   (when (and snapshot-store (behavior/should-snapshot? spec count))
     (try
       (p/save-snapshot! snapshot-store entity-type entity-id state
                         (cond-> {:messages-processed count}
-                          last-seq (assoc :sequence last-seq)))
+                          last-seq (assoc :sequence last-seq)
+                          (some? fencing) (assoc :fencing fencing)))
       (record-snapshot-metric! effect-ctx entity-type)
       (catch Throwable _t
         nil))))
@@ -42,7 +43,7 @@
     :else {:type effect}))
 
 (defn- execute-single-effect!
-  [{:keys [entity-type entity-id spec snapshot-store effect-ctx]} next-state effect]
+  [{:keys [entity-type entity-id spec snapshot-store state-atom effect-ctx]} next-state effect]
   (let [eff-map (extract-effect-map effect)
         eff-type (:type eff-map)
         {:keys [metrics actor-instruments]} effect-ctx
@@ -87,9 +88,11 @@
 
         (:snapshot :flush-snapshot)
         (when snapshot-store
-          (p/save-snapshot! snapshot-store entity-type entity-id next-state
-                            (or (:opts eff-map) {}))
-          (record-snapshot-metric! effect-ctx entity-type))
+          (let [fencing (or (when state-atom (:fencing @state-atom)) (:fencing effect-ctx))]
+            (p/save-snapshot! snapshot-store entity-type entity-id next-state
+                              (cond-> (or (:opts eff-map) {})
+                                (some? fencing) (assoc :fencing fencing)))
+            (record-snapshot-metric! effect-ctx entity-type)))
 
         (:fn :custom)
         (if-let [f (:fn eff-map)]
@@ -143,10 +146,16 @@
   (let [{:keys [entity-type entity-id spec snapshot-store state-atom effect-ctx]} actor
         {:keys [metrics actor-instruments]} effect-ctx
         {:keys [payload reply-fn context sequence]} envelope
-        current-state (:state @state-atom)
-        ctx (merge (build-actor-context entity-type entity-id)
-                   context
-                   (when sequence {:sequence sequence}))
+        curr-meta @state-atom
+        current-state (:state curr-meta)
+        effective-fencing (or (:fencing envelope)
+                              (:fencing context)
+                              (:fencing curr-meta)
+                              (:fencing effect-ctx))
+        ctx (cond-> (merge (build-actor-context entity-type entity-id)
+                           context)
+              sequence (assoc :sequence sequence)
+              (some? effective-fencing) (assoc :fencing effective-fencing))
         step-result (behavior/execute-step spec current-state payload ctx)
         next-state (:next-state step-result)
         reply (:reply step-result)
@@ -163,6 +172,7 @@
                                                :messages-processed new-count
                                                :last-active-at now)
                                   sequence (assoc :last-sequence sequence)
+                                  (some? effective-fencing) (assoc :fencing effective-fencing)
                                   tick-msg? (assoc :last-tick-at now)))))]
     (when (and metrics actor-instruments)
       (wrappers/record-actor-step! metrics actor-instruments entity-type op step-status
@@ -183,6 +193,7 @@
                                  next-state
                                  (:messages-processed updated-meta)
                                  (:last-sequence updated-meta)
+                                 (:fencing updated-meta)
                                  effect-ctx)))
 
 (defn- process-message-envelope!
@@ -216,12 +227,14 @@
 
 (defn- handle-flush-envelope!
   [{:keys [entity-type entity-id snapshot-store state-atom effect-ctx]} {:keys [reply-fn]}]
-  (let [curr @state-atom]
+  (let [curr @state-atom
+        fencing (or (:fencing curr) (:fencing effect-ctx))]
     (when snapshot-store
       (try
         (p/save-snapshot! snapshot-store entity-type entity-id (:state curr)
                           (cond-> {:messages-processed (:messages-processed curr)}
-                            (:last-sequence curr) (assoc :sequence (:last-sequence curr))))
+                            (:last-sequence curr) (assoc :sequence (:last-sequence curr))
+                            (some? fencing) (assoc :fencing fencing)))
         (record-snapshot-metric! effect-ctx entity-type)
         (catch Throwable _t nil)))
     (when reply-fn
@@ -262,10 +275,12 @@
       (finally
         (when snapshot-store
           (try
-            (let [curr @state-atom]
+            (let [curr @state-atom
+                  fencing (or (:fencing curr) (:fencing effect-ctx))]
               (p/save-snapshot! snapshot-store entity-type entity-id (:state curr)
                                 (cond-> {:messages-processed (:messages-processed curr)}
-                                  (:last-sequence curr) (assoc :sequence (:last-sequence curr))))
+                                  (:last-sequence curr) (assoc :sequence (:last-sequence curr))
+                                  (some? fencing) (assoc :fencing fencing)))
               (record-snapshot-metric! effect-ctx entity-type))
             (catch Throwable _t nil)))
         (when (and metrics actor-instruments)
@@ -286,6 +301,7 @@
                            :last-active-at now
                            :last-tick-at now
                            :last-sequence nil
+                           :fencing (:fencing eff-ctx)
                            :status :running})
          actor {:entity-type entity-type
                 :entity-id entity-id

@@ -5,6 +5,7 @@
   (:require [clojure.string :as str]
             [d-core.actor-system.protocols :as p]
             [d-core.core.consumers.async-proxy :as ap-cons]
+            [d-core.core.grpc :as grpc]
             [d-core.core.producers.async-proxy :as ap-prod]
             [d-core.core.producers.protocol :as prod]
             [d-core.libs.time :as time]))
@@ -216,5 +217,7 @@
 
 (defn close-async-proxy-transport!
   [^AsyncProxyTransport transport]
-  (when (and transport (:owns-client? transport))
-    (ap-prod/close-producer! (:producer transport))))
+  (when transport
+    (ap-prod/close-producer! (:producer transport))
+    (when (and (:owns-client? transport) (:grpc-client transport))
+      (grpc/close-client! (:grpc-client transport)))))

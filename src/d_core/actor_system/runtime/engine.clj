@@ -14,8 +14,12 @@
 (defn- activate-actor!
   [entity-type entity-id entity-spec snapshot-store effect-ctx]
   (let [snapshot (when snapshot-store
-                   (p/load-snapshot snapshot-store entity-type entity-id {}))
-        initial-state (behavior/initialize-state entity-spec entity-id snapshot)]
+                   (p/load-snapshot snapshot-store entity-type entity-id (or effect-ctx {})))
+        base-state (behavior/initialize-state entity-spec entity-id snapshot)
+        hydrate-fn (:hydrate-fn entity-spec)
+        initial-state (if hydrate-fn
+                        (hydrate-fn entity-id base-state (or effect-ctx {}))
+                        base-state)]
     (actor/create-actor entity-type entity-id entity-spec snapshot-store initial-state effect-ctx)))
 
 (defrecord ActorEngine [entity-specs snapshot-store active-map watchdog-stop-p effect-ctx-atom options]
