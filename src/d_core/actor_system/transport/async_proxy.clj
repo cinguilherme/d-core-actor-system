@@ -67,13 +67,17 @@
         ;; write being guarded by this value. The proxy cannot do that for us, and
         ;; the broker cannot either -- it has already delivered the message.
         fencing (:fencing delivery-env)
+        redelivered? (boolean (:redelivered? delivery-env))
+        seq-val (or (:sequence delivery-env) (:delivery-id delivery-env))
         env-with-reply (cond-> (assoc raw-env
-                                      :sequence (:delivery-id delivery-env)
+                                      :sequence seq-val
                                       :metadata meta-info
                                       :received-at received-at)
                          reply-p (assoc :reply-fn #(deliver reply-p %))
                          produced-at (assoc :produced-at produced-at)
                          pulled-at (assoc :pulled-at pulled-at)
+                         redelivered? (assoc :redelivered? true)
+                         redelivered? (update :context assoc :redelivered? true)
                          (some? fencing) (assoc :fencing fencing)
                          ;; The engine merges `:context` into the step's ctx, so
                          ;; this is how the epoch reaches the code that writes.
@@ -86,8 +90,15 @@
         (if (= reply-val ::timeout)
           {:disposition :retry
            :error "Timed out waiting for local actor step completion"}
-          {:disposition :ack
-           :reply reply-val})))))
+          (let [buffered? (and (map? reply-val) (true? (:buffered? reply-val)))
+                committed-seqs (when (map? reply-val) (:committed-sequences reply-val))
+                clean-reply (if (map? reply-val)
+                              (dissoc reply-val :buffered? :committed-sequences)
+                              reply-val)]
+            (cond-> {:disposition (if buffered? :buffered :ack)
+                     :reply clean-reply}
+              (seq committed-seqs)
+              (assoc :committed-sequences (vec committed-seqs)))))))))
 
 (defrecord AsyncProxyTransport [grpc-client producer owns-client? options]
   p/ActorTransport
@@ -190,7 +201,9 @@
                                                                  (:on-pause-blocked merged)))}})]
       {:entity-type (keyword entity-type)
        :subscription-id sub-id
-       :consumer consumer}))
+       :consumer consumer
+       :commit! (fn [commit-opts]
+                  (ap-cons/commit! consumer commit-opts))}))
 
   (unsubscribe! [_ subscription _opts]
     (when-let [consumer (:consumer subscription)]

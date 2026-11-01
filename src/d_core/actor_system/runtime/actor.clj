@@ -42,6 +42,17 @@
                          {:type t :args (vec (rest effect))}))
     :else {:type effect}))
 
+(defn- maybe-commit-flushed-effect!
+  [entity-type effect-ctx eff-map]
+  (when (and (:commit-fn effect-ctx)
+             (or (seq (:committed-sequences eff-map))
+                 (some? (:up-to-sequence eff-map))))
+    ((:commit-fn effect-ctx)
+     entity-type
+     {:sequences (:committed-sequences eff-map)
+      :up-to-sequence (or (:up-to-sequence eff-map)
+                          (:last-sequence eff-map))})))
+
 (defn- execute-single-effect!
   [{:keys [entity-type entity-id spec snapshot-store state-atom effect-ctx]} next-state effect]
   (let [eff-map (extract-effect-map effect)
@@ -94,6 +105,12 @@
                                 (some? fencing) (assoc :fencing fencing)))
             (record-snapshot-metric! effect-ctx entity-type)))
 
+        (:commit :transport/commit)
+        (when-let [commit-fn (:commit-fn effect-ctx)]
+          (commit-fn entity-type
+                     {:sequences (or (:sequences eff-map) (:committed-sequences eff-map))
+                      :up-to-sequence (or (:up-to-sequence eff-map) (:last-sequence eff-map))}))
+
         (:fn :custom)
         (if-let [f (:fn eff-map)]
           (f {:entity-type entity-type
@@ -105,13 +122,15 @@
             (custom-handler eff-map {:entity-type entity-type
                                      :entity-id entity-id
                                      :state next-state
-                                     :effect-ctx effect-ctx})))
+                                     :effect-ctx effect-ctx})
+            (maybe-commit-flushed-effect! entity-type effect-ctx eff-map)))
 
         (when custom-handler
           (custom-handler eff-map {:entity-type entity-type
                                    :entity-id entity-id
                                    :state next-state
-                                   :effect-ctx effect-ctx})))
+                                   :effect-ctx effect-ctx})
+          (maybe-commit-flushed-effect! entity-type effect-ctx eff-map)))
       (when (and metrics actor-instruments)
         (wrappers/record-actor-effect! metrics actor-instruments eff-type :ok
                                        (wrappers/duration-seconds eff-start)))

@@ -80,16 +80,23 @@
   (let [actual-storage (or storage (in-mem-storage/create-in-memory-snapshot-store))
         actual-transport (or transport (in-mem-transport/create-in-memory-transport))
         eff-metrics (or metrics (:metrics options))
+        subs-atom (atom {})
+        commit-fn (fn [entity-type commit-opts]
+                    (when-let [sub (get @subs-atom (keyword entity-type))]
+                      (when-let [cf (:commit! sub)]
+                        (cf commit-opts))))
         effect-ctx (cond-> (merge {:transport actual-transport
                                    :storage actual-storage
                                    :producer producer
                                    :db db
-                                   :effect-handler effect-handler}
+                                   :effect-handler effect-handler
+                                   :commit-fn commit-fn}
                                   (:effect-ctx options))
                      eff-metrics (assoc :metrics eff-metrics))
         engine-opts (assoc (or options {}) :effect-ctx effect-ctx)
         engine (engine/create-actor-engine entities actual-storage engine-opts)
-        subs (subscribe-all-entities! actual-transport engine entities (or options {}))]
+        subs (subscribe-all-entities! actual-transport engine entities (or options {}))
+        _ (reset! subs-atom (into {} (map (fn [s] [(keyword (:entity-type s)) s]) subs)))]
     {:engine engine
      :transport actual-transport
      :storage actual-storage
